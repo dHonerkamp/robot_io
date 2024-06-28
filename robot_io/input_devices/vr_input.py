@@ -37,13 +37,16 @@ class VrInput:
 
     def __init__(self, robot, workspace_limits, button_hold_threshold=60, tracking_error_threshold=0.03):
         self.robot = robot
-        self.vr_controller_id = 3
+        # self.vr_controller_id = 3
         self.POSITION = 1
         self.ORIENTATION = 2
         self.ANALOG = 3
         self.BUTTONS = 6
-        self.BUTTON_A = 2
-        self.BUTTON_B = 1
+        self.BUTTON_DEADMAN = 2
+        self.BUTTON_TOP = 1
+        self.BUTTON_TRIGGER = 33
+
+        # TODO: define for HSR
         self.gripper_orientation_offset = R.from_euler("xyz", [0, 0, np.pi / 2])
         self.vr_pos_uid = None
         self.vr_coord_rotation = np.eye(4)
@@ -61,6 +64,7 @@ class VrInput:
         self.prev_button_info = DEFAULT_RECORD_INFO
 
         self.calibrate_vr_coord_system()
+        print("calibrated")
 
     def _initialize_bullet(self):
         """
@@ -69,12 +73,13 @@ class VrInput:
         self.p = bc.BulletClient(connection_mode=p.SHARED_MEMORY)
         cid = self.p._client
         if cid < 0:
-            log.error("Failed to connect to SHARED_MEMORY bullet server.\n" " Is it running?")
+            print("Failed to connect to SHARED_MEMORY bullet server.\n" " Is it running?")
             sys.exit(1)
+        print(f"configureDebugVisualizer: {cid}")
         self.p.configureDebugVisualizer(self.p.COV_ENABLE_GUI, 0)
         self.p.configureDebugVisualizer(self.p.COV_ENABLE_VR_PICKING, 0)
         self.p.configureDebugVisualizer(self.p.COV_ENABLE_VR_RENDER_CONTROLLERS, 0)
-        log.info(f"Connected to server with id: {cid}")
+        print(f"Connected to server with id: {cid}")
 
     def get_action(self):
         """
@@ -102,16 +107,23 @@ class VrInput:
                 elif self._dead_mans_switch_triggered(event):
                     self.has_tracking_error = False
                     self.prev_action = None
+                    # if (self.robot_start_pos_offset is None):
                     self._reset_vr_coord_system(vr_action)
                 elif self.has_tracking_error:
                     return self.prev_action, record_info
                 # transform pose from vr coord system to robot base frame
-                robot_action = self._transform_action_vr_to_robot_base(vr_action)
-                robot_action = {"motion": robot_action, "ref": "abs"}
+                controller_pos_bf, controller_orn_bf, grip = self._transform_action_vr_to_robot_base(vr_action)
+                robot_action = {"controller_pos_bf": controller_pos_bf, 
+                                "controller_orn_bf": controller_orn_bf, 
+                                "grip": grip, 
+                                "trigger": event[self.BUTTONS][self.BUTTON_TRIGGER],
+                                "ref": "abs"}
+                
+                print(f"controller_pos_bf: {controller_pos_bf}, controller_orn_bf: {controller_orn_bf}")
 
                 if self._check_tracking_error(robot_action):
                     self.has_tracking_error = True
-                    log.error(f"Tracking error: {self.prev_action['motion'][0]}, {robot_action['motion'][0]}")
+                    print(f"Tracking error: {self.prev_action['controller_pos_bf']}, {robot_action['controller_pos_bf']}")
                     return self.prev_action, record_info
 
                 self.prev_action = robot_action
@@ -129,7 +141,7 @@ class VrInput:
             True if tracking error, False otherwise.
         """
         return self.prev_action is not None and np.any(
-            np.abs(current_action["motion"][0] - self.prev_action["motion"][0]) > self.tracking_error_threshold
+            np.abs(current_action["controller_pos_bf"] - self.prev_action["controller_pos_bf"]) > self.tracking_error_threshold
         )
 
     def _get_record_info(self, event):
@@ -170,19 +182,19 @@ class VrInput:
         return self.prev_button_info
 
     def _dead_mans_switch_down(self, event):
-        return bool(event[self.BUTTONS][self.BUTTON_A] & p.VR_BUTTON_IS_DOWN)
+        return bool(event[self.BUTTONS][self.BUTTON_DEADMAN] & p.VR_BUTTON_IS_DOWN)
 
     def _dead_mans_switch_triggered(self, event):
-        return bool(event[self.BUTTONS][self.BUTTON_A] & p.VR_BUTTON_WAS_TRIGGERED)
+        return bool(event[self.BUTTONS][self.BUTTON_DEADMAN] & p.VR_BUTTON_WAS_TRIGGERED)
 
     def _button_1_down(self, event):
-        return bool(event[self.BUTTONS][self.BUTTON_B] & p.VR_BUTTON_IS_DOWN)
+        return bool(event[self.BUTTONS][self.BUTTON_TOP] & p.VR_BUTTON_IS_DOWN)
 
     def _button_1_triggered(self, event):
-        return bool(event[self.BUTTONS][self.BUTTON_B] & p.VR_BUTTON_WAS_TRIGGERED)
+        return bool(event[self.BUTTONS][self.BUTTON_TOP] & p.VR_BUTTON_WAS_TRIGGERED)
 
     def _button_1_released(self, event):
-        return bool(event[self.BUTTONS][self.BUTTON_B] & p.VR_BUTTON_WAS_RELEASED)
+        return bool(event[self.BUTTONS][self.BUTTON_TOP] & p.VR_BUTTON_WAS_RELEASED)
 
     def _reset_vr_coord_system(self, vr_action):
         """
@@ -194,7 +206,12 @@ class VrInput:
         Args:
             vr_action (tuple): The current vr controller position, orientation and gripper action.
         """
-        pos, orn = self.robot.get_tcp_pos_orn()
+        # pos, orn = self.robot.get_tcp_pos_orn()
+        pose = self.robot.eef_pose
+        pos, orn = pose[:3], pose[3:]
+        # pos = [0., 0., 0.]
+        # orn = [0., 0., 0., 1.]
+
         T_VR = self.vr_coord_rotation @ pos_orn_to_matrix(vr_action[0], vr_action[1])
 
         self.robot_start_pos_offset = pos - T_VR[:3, 3]
@@ -216,7 +233,7 @@ class VrInput:
         """
         vr_pos, vr_orn, grip = vr_action
         # rotate vr coord system to align orientation with robot base frame
-        T_VR_Controller = self.vr_coord_rotation @ pos_orn_to_matrix(vr_action[0], vr_action[1])
+        T_VR_Controller = self.vr_coord_rotation @ pos_orn_to_matrix(vr_pos, vr_orn)
         # robot pos and orn are calculated relative to last reset
         robot_pos = T_VR_Controller[:3, 3] + self.robot_start_pos_offset
         robot_orn = R.from_matrix(T_VR_Controller[:3, :3]) * self.robot_start_orn_offset
@@ -265,39 +282,42 @@ class VrInput:
         """
         Wait until dead man's switch is pressed once.
         """
-        log.info("wait for start button press")
+        print("wait for start button press")
         action = None
         while action is None:
             action = self.get_action()
             time.sleep(0.1)
-        log.info("start button pressed")
+        print("start button pressed")
 
     def calibrate_vr_coord_system(self):
         """
         Align the orientation of the VR coordinate system to the robot base frame by moving the VR controller
         in x-direction of the robot base frame.
         """
+        print("calibrate_vr_coord_system")
         start_pose = None
         end_pose = None
-        log.info("------------------------------")
-        log.info("Setting up VR coordinate axes.")
-        log.info("Please do the following steps:")
-        log.info("1. Take VR controller and stand at the position from where you want to tele-operate the robot.")
-        log.info("2. Press dead man's switch once")
-        log.info("3. Move the controller in positive X-direction of the robot base frame.")
-        log.info("4. Press button 1 once.")
-        log.info("------------------------------")
+        print("------------------------------")
+        print("Setting up VR coordinate axes.")
+        print("Please do the following steps:")
+        print("1. Take VR controller and stand at the position from where you want to tele-operate the robot.")
+        print("2. Press dead man's switch once")
+        print("3. Move the controller in positive X-direction of the robot base frame.")
+        print("4. Press button 1 once.")
+        print("------------------------------")
         while True:
             vr_events = self.p.getVREvents()
             if vr_events != ():
                 for event in vr_events:
+                    
+                    # print([f'{k}: {np.argmax(v) if isinstance(v, tuple) else v}' for k, v in enumerate(event) if int(k) > 2])
                     # if event[0] == self.vr_controller_id:
                     vr_action = self._vr_event_to_action(event)
                     if self._dead_mans_switch_down(event) and start_pose is None:
-                        log.info("Now move vr controller in positive X-direction of the robot base frame.")
+                        print("Now move vr controller in positive X-direction of the robot base frame.")
                         start_pose = pos_orn_to_matrix(vr_action[0], vr_action[1])
                     elif self._button_1_down(event) and start_pose is not None and end_pose is None:
-                        log.info("Finished setting up VR coordinate system.")
+                        print("Finished setting up VR coordinate system.")
                         end_pose = pos_orn_to_matrix(vr_action[0], vr_action[1])
 
                     if start_pose is not None and end_pose is not None:
